@@ -1022,7 +1022,14 @@ if __name__ == "__main__":
     # Инициализация стратегии (TPU или CPU/GPU)
     strategy = initialize_strategy()
 
-    client = Client(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET")
+    # Инициализация клиента Binance
+    proxies = {
+        'http': 'http://your-proxy.com:port',
+        'https': 'http://your-proxy.com:port',
+    }
+
+    client = Client(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET", requests_params={"proxies": proxies})
+
     
     symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT','XRPUSDT', 'ADAUSDT', 'SOLUSDT', 'DOTUSDT', 'LINKUSDT', 'TONUSDT', 'NEARUSDT']
     

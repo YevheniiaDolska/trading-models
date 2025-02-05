@@ -1163,7 +1163,13 @@ def train_ensemble_model(data, selected_features, model_filename='flat_stacked_e
 if __name__ == "__main__":
     
     # Инициализация клиента Binance
-    client = Client(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET")
+    proxies = {
+        'http': 'http://your-proxy.com:port',
+        'https': 'http://your-proxy.com:port',
+    }
+
+    client = Client(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET", requests_params={"proxies": proxies})
+
     
     symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT','XRPUSDT', 'ADAUSDT', 'SOLUSDT', 'DOTUSDT', 'LINKUSDT', 'TONUSDT', 'NEARUSDT']
 
