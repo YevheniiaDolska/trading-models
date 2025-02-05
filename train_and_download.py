@@ -1,19 +1,31 @@
 import os
+import argparse
 import subprocess
 import sys
 import time
 import requests
 
-# === 1️⃣ УСТАНАВЛИВАЕМ API-КЛЮЧ (Перед запуском в Jupyter Notebook) ===
-#os.environ["RUNPOD_API_KEY"] = "твой_ключ"  # ⚠️ НЕ ХРАНИ API-КЛЮЧ В ФАЙЛЕ ПУБЛИЧНО!
-
+# === 1️⃣ Получаем API-ключ RunPod ===
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 
 if not RUNPOD_API_KEY:
-    print("❌ API-ключ не найден! Установите его перед запуском.")
+    print("❌ API-ключ не найден! Передайте его через `export RUNPOD_API_KEY=...` перед запуском.")
     sys.exit(1)
 
-# === 2️⃣ ЛОКАЛЬНЫЕ ПАПКИ ДЛЯ СОХРАНЕНИЯ ===
+# === 2️⃣ Получаем POD_ID (из аргумента или переменной окружения) ===
+parser = argparse.ArgumentParser()
+parser.add_argument("--pod_id", type=str, help="ID пода RunPod (если не передан, берётся из переменной окружения)")
+args = parser.parse_args()
+
+POD_ID = args.pod_id or os.getenv("POD_ID")
+
+if not POD_ID:
+    print("❌ POD_ID не задан! Передайте его через `--pod_id` или экспортируйте `export POD_ID=...`")
+    sys.exit(1)
+
+print(f"✅ Используется POD_ID: {POD_ID}")
+
+# === 3️⃣ Локальные папки для сохранения моделей ===
 BASE_LOCAL_DIR = r"C:\Users\Kroha\Documents\Auto-Blogging SaaS\devenv\Trading Bot\New Logic\Divided\3 models with a switcher"
 NEURAL_NETWORKS_DIR = os.path.join(BASE_LOCAL_DIR, "Neural_Networks")
 ENSEMBLE_MODELS_DIR = os.path.join(BASE_LOCAL_DIR, "Ensemble_Models")
@@ -21,24 +33,36 @@ ENSEMBLE_MODELS_DIR = os.path.join(BASE_LOCAL_DIR, "Ensemble_Models")
 os.makedirs(NEURAL_NETWORKS_DIR, exist_ok=True)
 os.makedirs(ENSEMBLE_MODELS_DIR, exist_ok=True)
 
-# === 3️⃣ УСТАНОВКА ЗАВИСИМОСТЕЙ ===
+# === 4️⃣ Установка зависимостей ===
 REQUIRED_PACKAGES = [
-    "numpy", "pandas", "matplotlib", "scipy", "tensorflow==2.11.0", "tensorflow-addons",
+    "numpy", "pandas", "matplotlib", "scipy", "tensorflow-addons",
     "scikit-learn", "imbalanced-learn", "xgboost", "catboost", "lightgbm", "joblib",
     "ta", "pandas-ta", "python-binance", "filterpy", "requests"
 ]
 
 def install_packages():
-    print("✅ Проверяем установку библиотек...")
+    print("✅ Устанавливаем зависимости...")
+
+    print("✅ Удаляем несовместимый numpy (если есть)...")
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "numpy"], check=False)
+
+    print("✅ Устанавливаем numpy 1.23.5 (совместим с TensorFlow 2.12.0)...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "numpy==1.23.5"], check=True)
+
+    print("✅ Устанавливаем TensorFlow 2.12.0...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "tensorflow==2.12.0"], check=True)
+
+    # Устанавливаем остальные зависимости
     for package in REQUIRED_PACKAGES:
         try:
             subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", package], check=True)
         except subprocess.CalledProcessError:
             print(f"⚠ Ошибка установки пакета: {package}")
 
+
 install_packages()
 
-# === 4️⃣ ПРОВЕРКА GPU ===
+# === 5️⃣ Проверка доступности GPU ===
 def check_gpu():
     print("\n🔍 Проверяем доступность GPU...")
     try:
@@ -53,9 +77,9 @@ def check_gpu():
 
 check_gpu()
 
-# === 5️⃣ ЗАПУСК ОБУЧЕНИЯ И СКАЧИВАНИЕ ПОСЛЕ КАЖДОЙ МОДЕЛИ ===
-MODELS_DIR = "/workspace/trading-models/neural_networks"
-OUTPUT_DIR = "/workspace/trading-models/output/neural_networks"
+# === 6️⃣ Запуск обучения и скачивание моделей ===
+MODELS_DIR = "/trading-models/neural_networks"
+OUTPUT_DIR = "/trading-models/output/neural_networks"
 
 MODELS = {
     "market_condition_classifier.py": "Market_Classifier",
@@ -76,11 +100,11 @@ def train_models():
             try:
                 subprocess.run(["python3", model_path], check=True)
 
-                # ✅ ПОСЛЕ ОБУЧЕНИЯ СРАЗУ СКАЧИВАЕМ МОДЕЛЬ
+                # ✅ Скачиваем модель после обучения
                 print(f"📥 Копируем обученную модель {model_name} в локальную папку...")
 
                 trained_model_path = os.path.join(OUTPUT_DIR, f"{model_name}.h5")
-                
+
                 if "Ensemble" in model_name:
                     local_model_path = os.path.join(ENSEMBLE_MODELS_DIR, f"{model_name}.h5")
                 else:
@@ -99,11 +123,17 @@ def train_models():
 
 train_models()
 
-# === 6️⃣ ОСТАНОВКА ПОДА В RUNPOD ПОСЛЕ ОБУЧЕНИЯ ===
+# === 7️⃣ Остановка пода в RunPod ===
 if RUNPOD_API_KEY:
     print("\n🔧 Работаем с RunPod...")
 
-    # Получаем список подов
+    # Проверяем, установлен ли runpod
+    try:
+        subprocess.run(["pip", "install", "runpod"], check=True)
+    except subprocess.CalledProcessError:
+        print("⚠ Ошибка установки runpod CLI, под не будет остановлен.")
+        sys.exit(1)
+
     try:
         response = requests.get(
             "https://api.runpod.io/v2/pod/list",
