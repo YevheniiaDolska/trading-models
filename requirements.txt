@@ -1,0 +1,34 @@
+# Основные библиотеки
+numpy
+pandas
+matplotlib
+scipy
+
+# TensorFlow и Keras
+tensorflow==2.11.0
+tensorflow-addons
+
+# Sklearn и инструменты машинного обучения
+scikit-learn
+imbalanced-learn
+xgboost
+catboost
+lightgbm
+joblib
+
+# TA-Lib и технический анализ
+ta
+pandas-ta
+
+# Binance API
+python-binance
+
+# Kalman filter
+filterpy
+
+# HTTP-запросы
+requests
+
+# Другие используемые библиотеки
+pandas_ta
+tensorflow.keras
