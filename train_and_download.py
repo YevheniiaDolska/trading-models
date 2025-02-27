@@ -1,4 +1,5 @@
 import os
+os.environ['NO_PROXY'] = '*'
 import subprocess
 import sys
 import argparse
@@ -120,9 +121,7 @@ print("✅ Архивация завершена!")
 # === 9️⃣ Загружаем в Google Drive в правильные папки ===
 def upload_to_drive(file_path, folder_name):
     print(f"\n🚀 Загружаем {file_path} в папку {folder_name} на Google Drive...")
-    subprocess.run([
-        "gdown", "--folder", "--id", GOOGLE_DRIVE_FOLDER_ID, file_path
-    ], check=True)
+    subprocess.run(["gdown", "--id", "1JCoUN-wQ2iIk5D6DiUoTj9PhS44lTnAp", "-O", "/workspace/neural_networks.zip"], check=True)
     print(f"✅ Файл {file_path} загружен в {folder_name} на Google Drive!")
 
 upload_to_drive("/workspace/neural_networks.zip", "Neural_Networks")
