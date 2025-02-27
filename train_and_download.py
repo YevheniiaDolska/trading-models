@@ -8,7 +8,7 @@ import requests
 POD_ID = "I7g6t43eehefh3"
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 GIT_REPO = "https://github.com/YevheniiaDolska/tr.git"
-BASE_DIR = "/workspace/tr"
+BASE_DIR = "/workspace/trading-models"
 OUTPUT_DIR = "/workspace/tr/output_models"
 GOOGLE_DRIVE_FOLDER_ID = "1JCoUN-wQ2iIk5D6DiUoTj9PhS44lTnAp"  # Твоя папка на Google Drive
 
