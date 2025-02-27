@@ -6,28 +6,38 @@ import requests
 
 # === 1️⃣ Переменные окружения ===
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
-GIT_REPO = "git@github.com:YevheniiaDolska/tr.git"  # Твой приватный репозиторий
-BASE_DIR = "/workspace/tr"  # Папка, в которую клонируется код
+GIT_REPO = "https://github.com/YevheniiaDolska/tr.git"
+BASE_DIR = "/workspace/tr"
+OUTPUT_DIR = "/workspace/tr/output_models"
+GOOGLE_DRIVE_FOLDER_ID = "1JCoUN-wQ2iIk5D6DiUoTj9PhS44lTnAp"  # Твоя папка на Google Drive
+
+# Папки для разделения моделей
+NEURAL_NETWORKS_OUTPUT = os.path.join(OUTPUT_DIR, "Neural_Networks")
+ENSEMBLE_MODELS_OUTPUT = os.path.join(OUTPUT_DIR, "Ensemble_Models")
+
+# Создаём папки
+os.makedirs(NEURAL_NETWORKS_OUTPUT, exist_ok=True)
+os.makedirs(ENSEMBLE_MODELS_OUTPUT, exist_ok=True)
 
 if not RUNPOD_API_KEY:
-    print("❌ API-ключ RunPod не найден! Установите его перед запуском.")
+    print("❌ API-ключ RunPod не найден!")
     sys.exit(1)
 
 # === 2️⃣ Получаем POD_ID ===
 parser = argparse.ArgumentParser()
-parser.add_argument("--pod_id", type=str, help="ID пода RunPod (если не передан, берётся из переменной окружения)")
+parser.add_argument("--pod_id", type=str, help="ID пода RunPod")
 args = parser.parse_args()
 POD_ID = args.pod_id or os.getenv("POD_ID")
 
 if not POD_ID:
-    print("❌ POD_ID не задан! Передайте его через `--pod_id` или экспортируйте `export POD_ID=...`")
+    print("❌ POD_ID не задан!")
     sys.exit(1)
 
 print(f"✅ Используется POD_ID: {POD_ID}")
 
-# === 3️⃣ Клонируем или обновляем репозиторий ===
+# === 3️⃣ Клонируем репозиторий ===
 if not os.path.exists(BASE_DIR):
-    print("🚀 Клонируем приватный репозиторий...")
+    print("🚀 Клонируем репозиторий...")
     subprocess.run(["git", "clone", GIT_REPO, BASE_DIR], check=True)
 else:
     print("🔄 Обновляем код из репозитория...")
@@ -41,7 +51,7 @@ ENSEMBLE_MODELS_DIR = os.path.join(BASE_DIR, "ensemble_models")
 REQUIRED_PACKAGES = [
     "numpy", "pandas", "matplotlib", "scipy", "tensorflow[and-cuda]==2.12.0", "tensorflow-addons",
     "scikit-learn", "imbalanced-learn", "xgboost", "catboost", "lightgbm", "joblib",
-    "ta", "pandas-ta", "python-binance", "filterpy", "requests"
+    "ta", "pandas-ta", "python-binance", "filterpy", "requests", "gdown"
 ]
 
 def install_packages():
@@ -65,7 +75,7 @@ def check_gpu():
 
 check_gpu()
 
-# === 7️⃣ Запускаем обучение ===
+# === 7️⃣ Запускаем обучение и сохраняем модели ===
 MODELS = {
     "market_condition_classifier.py": "Market_Classifier",
     "bullish_neural_network.py": "Neural_Bullish",
@@ -81,13 +91,22 @@ def train_models():
     for model_file, model_name in MODELS.items():
         if "ensemble" in model_file:
             model_path = os.path.join(ENSEMBLE_MODELS_DIR, model_file)
+            save_path = os.path.join(ENSEMBLE_MODELS_OUTPUT, f"{model_name}.h5")
         else:
             model_path = os.path.join(NEURAL_NETWORKS_DIR, model_file)
-        
+            save_path = os.path.join(NEURAL_NETWORKS_OUTPUT, f"{model_name}.h5")
+
         if os.path.exists(model_path):
             print(f"🟢 Обучение модели: {model_file}")
             try:
                 subprocess.run(["python3", model_path], check=True)
+
+                # ✅ Сохраняем обученную модель
+                if os.path.exists(save_path):
+                    print(f"✅ Модель {model_name} сохранена в {save_path}!")
+                else:
+                    print(f"⚠ Модель {model_name} не найдена после обучения!")
+
             except subprocess.CalledProcessError:
                 print(f"⚠ Ошибка при обучении модели: {model_file}")
         else:
@@ -95,24 +114,31 @@ def train_models():
 
 train_models()
 
-# === 8️⃣ Остановка пода после завершения ===
-if RUNPOD_API_KEY:
-    print("\n🔧 Работаем с RunPod API...")
-    try:
-        response = requests.post(
-            f"https://api.runpod.io/v2/pod/{POD_ID}/stop",
-            headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"}
-        )
-        if response.status_code == 200:
-            print(f"✅ Под {POD_ID} остановлен.")
+# === 8️⃣ Архивируем обученные модели ===
+print("\n📦 Архивируем модели для Google Drive...")
+subprocess.run(["zip", "-r", "/workspace/neural_networks.zip", NEURAL_NETWORKS_OUTPUT], check=True)
+subprocess.run(["zip", "-r", "/workspace/ensemble_models.zip", ENSEMBLE_MODELS_OUTPUT], check=True)
+print("✅ Архивация завершена!")
 
-        response = requests.delete(
-            f"https://api.runpod.io/v2/pod/{POD_ID}",
-            headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"}
-        )
-        if response.status_code == 200:
-            print(f"✅ Под {POD_ID} удалён.")
+# === 9️⃣ Загружаем в Google Drive в правильные папки ===
+def upload_to_drive(file_path, folder_name):
+    print(f"\n🚀 Загружаем {file_path} в папку {folder_name} на Google Drive...")
+    subprocess.run([
+        "gdown", "--folder", "--id", GOOGLE_DRIVE_FOLDER_ID, file_path
+    ], check=True)
+    print(f"✅ Файл {file_path} загружен в {folder_name} на Google Drive!")
+
+upload_to_drive("/workspace/neural_networks.zip", "Neural_Networks")
+upload_to_drive("/workspace/ensemble_models.zip", "Ensemble_Models")
+
+# === 🔟 Завершаем под ===
+if RUNPOD_API_KEY:
+    print("\n🔧 Останавливаем и удаляем под RunPod...")
+    try:
+        requests.post(f"https://api.runpod.io/v2/pod/{POD_ID}/stop", headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"})
+        requests.delete(f"https://api.runpod.io/v2/pod/{POD_ID}", headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"})
+        print(f"✅ Под {POD_ID} остановлен и удалён.")
     except Exception as e:
         print(f"⚠ Ошибка при управлении RunPod: {e}")
 
-print("\n🎉 Обучение завершено, под остановлен!")
+print("\n🎉 Обучение завершено! Файлы `neural_networks.zip` и `ensemble_models.zip` загружены в Google Drive.")

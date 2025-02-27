@@ -665,7 +665,7 @@ if __name__ == "__main__":
     symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT','XRPUSDT', 'ADAUSDT', 'SOLUSDT', 'DOTUSDT', 'LINKUSDT', 'TONUSDT', 'NEARUSDT']
     
     start_date = datetime(2017, 1, 1)
-    end_date = datetime(2023, 12, 31)
+    end_date = datetime(2024, 7, 31)
     
     data_path = "labeled_market_data.csv"  # Путь к размеченным данным
     model_path = "market_condition_classifier.h5"  # Путь для сохранения модели
