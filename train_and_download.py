@@ -5,6 +5,7 @@ import argparse
 import requests
 
 # === 1️⃣ Переменные окружения ===
+POD_ID = "I7g6t43eehefh3"
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 GIT_REPO = "https://github.com/YevheniiaDolska/tr.git"
 BASE_DIR = "/workspace/tr"
@@ -24,10 +25,6 @@ if not RUNPOD_API_KEY:
     sys.exit(1)
 
 # === 2️⃣ Получаем POD_ID ===
-parser = argparse.ArgumentParser()
-parser.add_argument("--pod_id", type=str, help="ID пода RunPod")
-args = parser.parse_args()
-POD_ID = args.pod_id or os.getenv("POD_ID")
 
 if not POD_ID:
     print("❌ POD_ID не задан!")
