@@ -39,7 +39,7 @@ ENSEMBLE_MODELS_DIR = os.path.join(BASE_DIR, "ensemble_models")
 
 # === 5️⃣ Установка зависимостей ===
 REQUIRED_PACKAGES = [
-    "numpy", "pandas", "matplotlib", "scipy", "tensorflow-addons",
+    "numpy", "pandas", "matplotlib", "scipy", "tensorflow[and-cuda]==2.12.0", "tensorflow-addons",
     "scikit-learn", "imbalanced-learn", "xgboost", "catboost", "lightgbm", "joblib",
     "ta", "pandas-ta", "python-binance", "filterpy", "requests"
 ]
