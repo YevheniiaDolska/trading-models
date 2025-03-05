@@ -5,101 +5,224 @@ import os
 from datetime import datetime, timedelta
 from binance.client import Client
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
 import logging
 import pandas_ta as ta
 import requests
 from scipy.stats import zscore
-from tensorflow.keras.metrics import Precision, Recall
+from tensorflow.keras.metrics import Precision, Recall, AUC
 from tensorflow.keras.regularizers import l2
-from sklearn.model_selection import KFold
 import time
-from tensorflow.keras.metrics import AUC, Recall
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from binance.exceptions import BinanceAPIException
+import zipfile
+from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
+import tensorflow.keras.backend as K
+import xgboost as xgb
+from tensorflow.keras.layers import Layer, GRU, Input, Concatenate
+from sklearn.ensemble import VotingClassifier
+import matplotlib.pyplot as plt
+from tensorflow.keras.backend import clear_session
+import glob
+import requests
+import zipfile
+from io import BytesIO
+from threading import Lock
+from ta.trend import SMAIndicator
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout, Input, Concatenate
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
+import tensorflow.keras.backend as K
+from sklearn.model_selection import StratifiedKFold
+from sklearn.dummy import DummyClassifier
+from scipy.stats import zscore  
 
 
-# Инициализация GPU
+
+# ✅ Использование GPU, если доступно
 def initialize_strategy():
-    # Проверяем наличие GPU
-    gpus = tf.config.list_physical_devices('GPU')
+    gpus = tf.config.experimental.list_physical_devices('GPU')
     if gpus:
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
-            strategy = tf.distribute.MirroredStrategy()
-            print(f'Running on {len(gpus)} GPUs')
+            logging.info("✅ Используется GPU!")
+            return tf.distribute.MirroredStrategy()
         except RuntimeError as e:
-            print(e)
+            logging.warning(f"⚠ Ошибка при инициализации GPU: {e}")
+            return tf.distribute.get_strategy()
     else:
-        strategy = tf.distribute.get_strategy()
-        print('Running on CPU')
-    return strategy
+        logging.info("❌ GPU не найден, используем CPU")
+        return tf.distribute.get_strategy()
+
     
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+def cleanup_training_files():
+    """
+    Удаляет файлы с обучающими данными после завершения обучения нейросети.
+    """
+    files_to_delete = glob.glob("binance_data*.csv")  # Ищем все файлы данных
+    for file_path in files_to_delete:
+        try:
+            os.remove(file_path)
+            logging.info(f"🗑 Удалён файл: {file_path}")
+        except Exception as e:
+            logging.error(f"⚠ Ошибка удаления {file_path}: {e}")
+            
+            
+
+class Attention(Layer):
+    """Attention-механизм для выделения важных временных точек"""
+    def __init__(self):
+        super(Attention, self).__init__()
+
+    def build(self, input_shape):
+        self.W = self.add_weight(name="att_weight", shape=(input_shape[-1], 1), initializer="normal")
+        self.b = self.add_weight(name="att_bias", shape=(1,), initializer="zeros")
+        super(Attention, self).build(input_shape)
+
+    def call(self, x):
+        e = K.tanh(K.dot(x, self.W) + self.b)
+        a = K.softmax(e, axis=1)
+        return x * a
+    
 class MarketClassifier:
-    def __init__(self, client=None, model_path="market_condition_classifier.h5", scaler_path="scaler.pkl"):
-        self.client = client if client else Client(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET")
+    def __init__(self, model_path="market_condition_classifier.h5", scaler_path="scaler.pkl"):
         self.model_path = model_path
         self.scaler_path = scaler_path
+        self.base_url = "https://data.binance.vision/data/spot/monthly/klines/{symbol}/1m/"
 
-        
     def fetch_binance_data(self, symbol, interval, start_date, end_date):
         """
-        Скачивает исторические данные с Binance.
+        Скачивает исторические данные с Binance без API-ключа (архив Binance) для заданного символа.
+        Возвращает DataFrame с колонками: timestamp, open, high, low, close, volume.
         """
-        data = []
-        while start_date < end_date:
+        base_url_monthly = "https://data.binance.vision/data/spot/monthly/klines"
+        logging.info(f"📡 Загрузка данных с Binance для {symbol} ({interval}) c {start_date} по {end_date}...")
+
+        start_date = pd.to_datetime(start_date)
+        end_date = pd.to_datetime(end_date)
+        all_data = []
+        downloaded_files = set()
+        download_lock = Lock()  # Глобальная блокировка скачивания, чтобы избежать дублирования
+
+        def download_and_process(date):
+            year, month = date.year, date.month
+            month_str = f"{month:02d}"
+            file_name = f"{symbol}-{interval}-{year}-{month_str}.zip"
+            file_url = f"{base_url_monthly}/{symbol}/{interval}/{file_name}"
+
+            # Проверка на уже загруженные файлы
+            with download_lock:
+                if file_name in downloaded_files:
+                    logging.info(f"⏩ Пропуск {file_name}, уже загружено.")
+                    return None
+
+                logging.info(f"🔍 Проверка наличия {file_url}...")
+                response = requests.head(file_url, timeout=5)
+                if response.status_code != 200:
+                    logging.warning(f"⚠ Файл не найден: {file_url}")
+                    return None
+
+                logging.info(f"📥 Скачивание {file_url}...")
+                response = requests.get(file_url, timeout=15)
+                if response.status_code != 200:
+                    logging.warning(f"⚠ Ошибка загрузки {file_url}: Код {response.status_code}")
+                    return None
+
+                logging.info(f"✅ Успешно загружен {file_name}")
+                downloaded_files.add(file_name)
+
             try:
-                # Ограничиваем порции данных на 2 дня
-                try:
-                    next_date = min(start_date + timedelta(days=2), end_date)
-                    logging.info(f"Запрос данных: {symbol}, {start_date}, {next_date}")
-                    klines = self.client.get_historical_klines(
-                        symbol, interval,
-                        start_date.strftime("%d %b %Y %H:%M:%S"),
-                        next_date.strftime("%d %b %Y %H:%M:%S")
-                    )
-                    logging.info(f"Ответ от Binance API: {klines[:5]}...")  # Лог первых 5 строк
-                except Exception as e:
-                    logging.error(f"Ошибка API: {e}")
-
-                if not klines:
-                    logging.warning(f"Нет данных для {symbol} с {start_date} по {next_date}.")
-                    start_date = next_date
-                    continue
-
-                temp_data = pd.DataFrame(klines, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'quote_asset_volume', 'number_of_trades',
-                    'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-                ])
-                temp_data['timestamp'] = pd.to_datetime(temp_data['timestamp'], unit='ms')
-                temp_data.set_index('timestamp', inplace=True)
-                data.append(temp_data[['open', 'high', 'low', 'close', 'volume']].astype(float))
-                start_date = datetime.fromtimestamp(klines[-1][0] / 1000) + timedelta(minutes=1)
-                
-                # Задержка в 1 секунду между запросами
-                time.sleep(1)  
+                with zipfile.ZipFile(BytesIO(response.content)) as zip_file:
+                    csv_file = file_name.replace('.zip', '.csv')
+                    with zip_file.open(csv_file) as file:
+                        df = pd.read_csv(
+                            file, header=None, 
+                            names=[
+                                "timestamp", "open", "high", "low", "close", "volume",
+                                "close_time", "quote_asset_volume", "number_of_trades",
+                                "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+                            ],
+                            dtype={
+                                "timestamp": "int64",
+                                "open": "float32",
+                                "high": "float32",
+                                "low": "float32",
+                                "close": "float32",
+                                "volume": "float32",
+                                "quote_asset_volume": "float32",
+                                "number_of_trades": "int32",
+                                "taker_buy_base_asset_volume": "float32",
+                                "taker_buy_quote_asset_volume": "float32"
+                            },
+                            low_memory=False
+                        )
+                        # Преобразуем timestamp в datetime
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+                        # Выбираем только необходимые колонки
+                        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                        # Приводим числовые колонки к типу float, не затрагивая timestamp
+                        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+                        # Устанавливаем timestamp в качестве индекса для агрегации
+                        df.set_index("timestamp", inplace=True)
+                        return df
             except Exception as e:
-                logging.error(f"Ошибка при загрузке данных {symbol}: {e}")
-                break
-        if not data:
-            raise ValueError(f"Нет данных для {symbol} за указанный период.")
-        df = pd.concat(data)
-        # Проверка интервала на минутные данные
-        assert (df.index.to_series().diff().dropna() == pd.Timedelta(minutes=1)).all(), "Данные не минутные!"
+                logging.error(f"❌ Ошибка обработки {symbol} за {date.strftime('%Y-%m')}: {e}")
+                return None
+
+        # Запускаем скачивание в многопоточном режиме
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(download_and_process, pd.date_range(start=start_date, end=end_date, freq='MS')))
+
+        # Собираем загруженные данные
+        all_data = [df for df in results if df is not None]
+
+        if not all_data:
+            raise ValueError(f"❌ Не удалось загрузить ни одного месяца данных для {symbol}.")
+
+        df = pd.concat(all_data)
+        logging.info(f"📊 Итоговая форма данных: {df.shape}")
+
+        # Если вдруг колонка 'timestamp' отсутствует как столбец, сбрасываем индекс
+        if "timestamp" not in df.columns:
+            df.reset_index(inplace=True)
+
+        # Гарантируем, что timestamp имеет правильный тип
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df.set_index("timestamp", inplace=True)
+
+        # Агрегация до 1-минутного таймфрейма
+        df = df.resample('1min').ffill()
+
+        # Сброс индекса, чтобы timestamp стал обычной колонкой
+        df.reset_index(inplace=True)
+
+        # Обработка пропущенных значений
+        num_nans = df.isna().sum().sum()
+        if num_nans > 0:
+            if num_nans / len(df) > 0.05:  # Если более 5% данных пропущены
+                logging.warning("⚠ Пропущено слишком много данных! Пропускаем эти свечи.")
+                df.dropna(inplace=True)
+            else:
+                df.fillna(method='ffill', inplace=True)
+
+        logging.info(f"✅ Данные успешно загружены: {len(df)} записей")
         return df
 
-
+        
 
     def add_indicators(self, data):
         """Расширенный набор индикаторов для точной классификации с использованием pandas_ta"""
@@ -352,7 +475,6 @@ class MarketClassifier:
         """
         Удаляет выбросы на основе метода Z-score.
         """
-        from scipy.stats import zscore  # Импортируем stats, если он отсутствует
         z_scores = zscore(data[['open', 'high', 'low', 'close', 'volume']])
         mask = (np.abs(z_scores) < z_threshold).all(axis=1)
         filtered_data = data[mask]
@@ -404,21 +526,18 @@ class MarketClassifier:
         logging.info(f"Автоматические флаги рыночных событий добавлены.")
         return data
 
-    def fetch_and_label_all(self, symbols, start_date, end_date, save_path="labeled_data", api_key=None):
+    def fetch_and_label_all(self, symbols, start_date, end_date, save_path="labeled_data"):
+        """
+        Загружает и размечает данные для нескольких торговых пар без использования API.
+        """
         os.makedirs(save_path, exist_ok=True)
         all_data = []
-        events = self.fetch_market_events(api_key, start_date, end_date) if api_key else []
 
         for symbol in symbols:
             try:
                 logging.info(f"Загрузка данных для {symbol}")
-                df = self.fetch_binance_data(symbol, Client.KLINE_INTERVAL_1MINUTE, start_date, end_date)
-                # Исправлено data на df
-                logging.info(f"Тип данных перед добавлением индикаторов: {type(df)}")
+                df = self.fetch_binance_data(symbol, "1m", start_date, end_date)  # ✅ Убрано использование API
                 df = self.add_indicators(df)
-                logging.info(f"Тип данных после добавления индикаторов: {type(df)}")
-                if events:
-                    df = self.flag_market_events(df, events)
                 df['market_type'] = self.classify_market_conditions(df)
                 df['symbol'] = symbol
                 file_path = os.path.join(save_path, f"{symbol}_data.csv")
@@ -427,10 +546,12 @@ class MarketClassifier:
                 all_data.append(df)
             except Exception as e:
                 logging.error(f"Ошибка при обработке {symbol}: {e}")
-                
+
         if not all_data:
             raise ValueError("Не удалось собрать данные ни для одного символа.")
+        
         return pd.concat(all_data, ignore_index=True)
+
 
     
     def prepare_training_data(self, data_path):
@@ -461,80 +582,155 @@ class MarketClassifier:
         # Проверка значений market_type до обработки
         logging.info(f"Уникальные значения market_type до преобразования: {data['market_type'].unique()}")
 
-        # Удаление выбросов
+        # Удаление выбросов (только один вызов!)
         logging.info("Удаление выбросов из данных...")
         data = self.remove_outliers(data)
         logging.info(f"Размер данных после удаления выбросов: {data.shape}")
 
         # Преобразование меток рынка в числовые значения
         label_mapping = {'bullish': 0, 'bearish': 1, 'flat': 2}
-        logging.info(f"До преобразования меток, уникальные значения: {data['market_type'].unique()}")
         data['market_type'] = data['market_type'].map(label_mapping)
-        logging.info(f"После преобразования меток, уникальные значения: {data['market_type'].unique()}")
-        logging.info(f"Количество примеров каждого класса:\n{data['market_type'].value_counts()}")
-        
-        # Проверка после преобразования
+
+        # Удаление строк с NaN после преобразования
         if data['market_type'].isna().any():
             bad_values = data[data['market_type'].isna()]['market_type'].unique()
             logging.error(f"Обнаружены NaN значения в market_type! Исходные значения: {bad_values}")
-            data = data.dropna(subset=['market_type'])
-        
+            data.dropna(subset=['market_type'], inplace=True)
+
         features = [col for col in data.columns if col not in ['market_type', 'symbol', 'timestamp']]
         X = data[features].values
         y = data['market_type'].values.astype(int)
-        
+
         logging.info(f"Форма X: {X.shape}")
         logging.info(f"Форма y: {y.shape}")
-        logging.info(f"Уникальные значения в y: {np.unique(y)}")
-        
+
         return X, y
 
 
+
     def balance_classes(self, y):
-        """
-        Рассчитывает веса классов для балансировки.
-        """
-        class_weights = compute_class_weight(
+        # Приводим y к numpy-массиву, если это ещё не сделано
+        y = np.array(y)
+        # Вычисляем веса для классов, присутствующих в y
+        present_classes = np.unique(y)
+        computed_weights = compute_class_weight(
             class_weight='balanced',
-            classes=np.unique(y),
+            classes=present_classes,
             y=y
         )
-        return {i: weight for i, weight in enumerate(class_weights)}
-
-    def build_lstm_model(self, input_shape):
-        model = Sequential([
-            LSTM(256, input_shape=input_shape, return_sequences=True, 
-                 kernel_regularizer=l2(0.01), recurrent_regularizer=l2(0.01)),
-            Dropout(0.3),
-            LSTM(128, return_sequences=True,
-                 kernel_regularizer=l2(0.01), recurrent_regularizer=l2(0.01)),
-            Dropout(0.3),
-            LSTM(64),
-            Dropout(0.3),
-            Dense(64, activation='relu', kernel_regularizer=l2(0.01)),
-            Dropout(0.3),
-            Dense(32, activation='relu', kernel_regularizer=l2(0.01)),
-            Dense(3, activation='softmax')  # 3 класса: bullish, bearish, flat
-        ])
+        # Формируем словарь для тех классов, которые есть
+        class_weights = {int(cls): weight for cls, weight in zip(present_classes, computed_weights)}
         
-        model.compile(
-            optimizer='adam',
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
+        # Гарантируем, что словарь содержит все три класса: 0, 1 и 2
+        for cls in [0, 1, 2]:
+            if cls not in class_weights:
+                # Если класс отсутствует в y, то его вес взять равным 1.0
+                # (в дальнейшем на полном наборе данных этот случай возникать не должен)
+                class_weights[cls] = 1.0
+        return class_weights
+
+
+
+
+
+    def build_lstm_gru_model(self, input_shape):
+        """Создаёт мощный ансамбль LSTM + GRU с Attention"""
+        inputs = Input(shape=input_shape)
+
+        # LSTM блок
+        lstm_out = LSTM(256, return_sequences=True, kernel_regularizer=l2(0.01))(inputs)
+        lstm_out = Dropout(0.3)(lstm_out)
+        lstm_out = LSTM(128, return_sequences=True, kernel_regularizer=l2(0.01))(lstm_out)
+        lstm_out = Dropout(0.3)(lstm_out)
+        lstm_out = LSTM(64, return_sequences=True, kernel_regularizer=l2(0.01))(lstm_out)
+
+        # GRU блок
+        gru_out = GRU(256, return_sequences=True, kernel_regularizer=l2(0.01))(inputs)
+        gru_out = Dropout(0.3)(gru_out)
+        gru_out = GRU(128, return_sequences=True, kernel_regularizer=l2(0.01))(gru_out)
+        gru_out = Dropout(0.3)(gru_out)
+        gru_out = GRU(64, return_sequences=True, kernel_regularizer=l2(0.01))(gru_out)
+
+        # Объединяем выходы LSTM и GRU
+        combined = Concatenate()([lstm_out, gru_out])
+
+        # Attention-механизм
+        attention = Attention()(combined)
+
+        # Финальные Dense-слои
+        x = LSTM(64, return_sequences=False)(attention)
+        x = Dropout(0.3)(x)
+        x = Dense(64, activation='relu', kernel_regularizer=l2(0.01))(x)
+        x = Dropout(0.3)(x)
+        x = Dense(32, activation='relu', kernel_regularizer=l2(0.01))(x)
+        outputs = Dense(3, activation='softmax')(x)  # 3 класса: bullish, bearish, flat
+
+        model = tf.keras.models.Model(inputs, outputs)
+        model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
         return model
 
 
-    # Обучение классификатора с автоматическим восстановлением прогресса
-    def train_market_condition_classifier(self, data_path, model_path='market_condition_classifier.h5', scaler_path='scaler.pkl', checkpoint_path='market_condition_checkpoint.h5'):
+    def train_xgboost(self, X_train, y_train):
+        """Обучает XGBoost на эмбеддингах LSTM + GRU, или возвращает DummyClassifier, если в y_train только один класс."""
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) < 2:
+            logging.warning("В обучающем наборе XGB обнаружен только один класс. Используем DummyClassifier.")
+            dummy = DummyClassifier(strategy='constant', constant=unique_classes[0])
+            dummy.fit(X_train, y_train)
+            return dummy
+        else:
+            booster = xgb.XGBClassifier(
+                objective='multi:softmax',
+                num_class=3,
+                learning_rate=0.1,
+                n_estimators=10,
+                max_depth=3,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                verbosity=1
+            )
+            booster.fit(X_train, y_train)
+            return booster
+
+
+    def build_ensemble(X_train, y_train):
+        """Финальный ансамбль: LSTM + GRU + XGBoost"""
+        lstm_gru_model = build_lstm_gru_model((X_train.shape[1], X_train.shape[2]))
+
+        # Обучаем LSTM-GRU
+        lstm_gru_model.fit(X_train, y_train, epochs=100, batch_size=64, verbose=1)#epochs=100
+
+        # Извлекаем эмбеддинги из последнего слоя перед softmax
+        feature_extractor = tf.keras.models.Model(
+            inputs=lstm_gru_model.input, outputs=lstm_gru_model.layers[-3].output
+        )
+        X_features = feature_extractor.predict(X_train)
+
+        # Обучаем XGBoost на эмбеддингах
+        xgb_model = self.train_xgboost(X_features, y_train)
+
+        # Ансамбль моделей через VotingClassifier
+        ensemble = VotingClassifier(
+            estimators=[
+                ('lstm_gru', lstm_gru_model),
+                ('xgb', xgb_model)
+            ],
+            voting='soft'
+        )
+        return ensemble
+
+
+    def train_market_condition_classifier(self, data_path, model_path='market_condition_classifier.h5',
+                                          scaler_path='scaler.pkl', checkpoint_path='market_condition_checkpoint.h5'):
         """
-        Обучает и сохраняет LSTM модель классификации рыночных условий с кросс-валидацией
+        Обучает и сохраняет ансамблевую модель классификации рыночных условий с кросс-валидацией.
+        Теперь использует LSTM + GRU + Attention + XGBoost и требует минимум 85% точности перед финальным обучением.
         """
         # Подготовка данных
         X, y = self.prepare_training_data(data_path)
-        
+
         # Масштабирование данных
-        scaler = StandardScaler()
+        scaler = RobustScaler()  # ✅ Исправлено (теперь RobustScaler правильно импортируется)
         if os.path.exists(scaler_path):
             logging.info(f"Загружается существующий масштабировщик из {scaler_path}.")
             scaler = joblib.load(scaler_path)
@@ -543,136 +739,158 @@ class MarketClassifier:
             scaler.fit(X)
             joblib.dump(scaler, scaler_path)
             logging.info(f"Масштабировщик сохранён в {scaler_path}.")
-        
+
         X_scaled = scaler.transform(X)
 
-        # Кросс-валидация для оценки качества модели
-        kfold = KFold(n_splits=5, shuffle=True, random_state=42)
+        # Кросс-валидация для оценки модели
+        skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
         fold_scores = []
+        f1_scores = []
 
-        for fold, (train_idx, val_idx) in enumerate(kfold.split(X_scaled)):
-            X_train_fold = X_scaled[train_idx]
-            y_train_fold = y[train_idx]
-            X_val_fold = X_scaled[val_idx]
-            y_val_fold = y[val_idx]
-            
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X_scaled, y)):
+            X_train_fold, X_val_fold = X_scaled[train_idx], X_scaled[val_idx]
+            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+
             # Подготовка данных для LSTM
             X_train_fold = np.expand_dims(X_train_fold, axis=1)
             X_val_fold = np.expand_dims(X_val_fold, axis=1)
-            
+
+            logging.info(f"Обучение на фолде {fold + 1}")
             logging.info(f"Shape X_train_fold: {X_train_fold.shape}")
             logging.info(f"Shape y_train_fold: {y_train_fold.shape}")
-            logging.info(f"Уникальные значения в y_train_fold: {np.unique(y_train_fold)}")  # Добавляем проверку
-            
+
             # Создание и обучение модели для текущего фолда
             with strategy.scope():
-                model_fold = self.build_lstm_model(input_shape=(X_train_fold.shape[1], X_train_fold.shape[2]))
-                history_fold = model_fold.fit(
+                model_fold = self.build_lstm_gru_model(input_shape=(X_train_fold.shape[1], X_train_fold.shape[2]))  # ✅ Используем обновленную модель с GRU + Attention
+
+                model_fold.fit(
                     X_train_fold, y_train_fold,
-                    epochs=50,
+                    epochs=50,#50
                     batch_size=64,
                     validation_data=(X_val_fold, y_val_fold),
                     verbose=1
                 )
 
-        # Важно! Тут нужно так же подготовить данные для финальной модели
-        X_scaled = np.expand_dims(X_scaled, axis=1)  # Добавляем эту строку
-        logging.info(f"Shape X_scaled для финальной модели: {X_scaled.shape}")
-        logging.info(f"Уникальные значения в y для финальной модели: {np.unique(y)}")
+            # Оценка на валидации
+            y_val_pred = model_fold.predict(X_val_fold)
+            y_val_pred_classes = np.argmax(y_val_pred, axis=1)
 
-        # Если кросс-валидация успешна, обучаем финальную модель
-        if np.mean(fold_scores) >= 0.7:
-            # Разделение на обучающую и тестовую выборки
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-            
-            # Балансировка классов
-            class_weights = self.balance_classes(y_train)
+            val_acc = accuracy_score(y_val_fold, y_val_pred_classes)
+            val_f1 = f1_score(y_val_fold, y_val_pred_classes, average='weighted')
 
-            # Создание финальной модели
-            with strategy.scope():
-                model = self.build_lstm_model(input_shape=(X_train.shape[1], X_train.shape[2]))
+            fold_scores.append(val_acc)
+            f1_scores.append(val_f1)
 
-                callbacks = [
-                    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-                    ModelCheckpoint(checkpoint_path, save_best_only=True, monitor='val_loss', verbose=1),
-                    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5)
-                ]
+        # Финальная проверка перед обучением последней версии модели
+        avg_accuracy = np.mean(fold_scores)
+        avg_f1_score = np.mean(f1_scores)
 
-                history = model.fit(
-                    X_train, y_train,
-                    validation_data=(X_test, y_test),
-                    epochs=500,
-                    batch_size=64,
-                    class_weight=class_weights,
-                    callbacks=callbacks
-                )
-                
-                # Оценка финальной модели
-                y_pred = model.predict(X_test)
-                y_pred_classes = np.argmax(y_pred, axis=1)
+        logging.info(f"Средняя точность на кросс-валидации: {avg_accuracy:.4f}")
+        logging.info(f"Средний F1-score на кросс-валидации: {avg_f1_score:.4f}")
 
-                accuracy = accuracy_score(y_test, y_pred_classes)
-                precision = precision_score(y_test, y_pred_classes, average='weighted')
-                recall = recall_score(y_test, y_pred_classes, average='weighted')
-                f1 = f1_score(y_test, y_pred_classes, average='weighted')
+        if avg_accuracy < 0.85 or avg_f1_score < 0.80:
+            logging.warning("Качество модели ниже 85% точности или 80% F1-score. Доработайте архитектуру.")
+            return None  # Если качество низкое, не продолжаем
 
-                logging.info(f"""
-                   Метрики финальной модели:
-                   Accuracy: {accuracy:.4f}
-                   Precision: {precision:.4f}
-                   Recall: {recall:.4f}
-                   F1-Score: {f1:.4f}
-               """)
+        # Финальное обучение на всей выборке
+        X_scaled = np.expand_dims(X_scaled, axis=1)  # Добавляем временную ось для LSTM
 
-               # Сохранение только если финальные метрики хорошие
-                if f1 >= 0.7:
-                   model.save(model_path)
-                   logging.info(f"Финальная модель сохранена в {model_path}")
-                   
-                   # Построение графика обучения
-                   plt.figure(figsize=(10, 6))
-                   plt.plot(history.history['loss'], label='Train Loss')
-                   plt.plot(history.history['val_loss'], label='Validation Loss', linestyle='--')
-                   plt.legend()
-                   plt.title('Train vs Validation Loss')
-                   plt.xlabel('Epochs')
-                   plt.ylabel('Loss')
-                   plt.grid(True)
-                   plt.show()
-                   
-                   return model
-                else:
-                   logging.warning("Финальное качество модели ниже порогового (0.7). Модель не сохранена.")
-                   return None
-        else:
-           logging.warning("Кросс-валидация показала низкое качество модели. Требуется доработка архитектуры.")
-           return None
+        # Разделение данных для финальной модели
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+
+        # Балансировка классов
+        class_weights = self.balance_classes(y_train)
+
+        # Создание финальной модели
+        with strategy.scope():
+            final_model = self.build_lstm_gru_model(input_shape=(X_train.shape[1], X_train.shape[2]))  # ✅ Используем LSTM + GRU + Attention
+
+            callbacks = [
+                EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+                ModelCheckpoint(checkpoint_path, save_best_only=True, monitor='val_loss', verbose=1),
+                ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5)
+            ]
+
+            history = final_model.fit(
+                X_train, y_train,
+                validation_data=(X_test, y_test),
+                epochs=200,#200
+                batch_size=64,
+                class_weight=class_weights,
+                callbacks=callbacks
+            )
+
+            # **Обучаем XGBoost на эмбеддингах LSTM + GRU**
+            feature_extractor = tf.keras.models.Model(
+                inputs=final_model.input, outputs=final_model.layers[-3].output  # ✅ Берем эмбеддинги перед softmax
+            )
+            X_train_features = feature_extractor.predict(X_train)
+            X_test_features = feature_extractor.predict(X_test)
+
+            xgb_model = self.train_xgboost(X_train_features, y_train)  # ✅ Обучаем XGBoost
+
+            # **Оценка финальной модели**
+            y_pred_lstm_gru = final_model.predict(X_test)
+            y_pred_xgb = xgb_model.predict(X_test_features)
+
+            # **Ансамбль голосованием**
+            y_pred_classes = np.argmax(y_pred_lstm_gru, axis=1) * 0.5 + y_pred_xgb * 0.5
+            y_pred_classes = np.round(y_pred_classes).astype(int)
+
+            accuracy = accuracy_score(y_test, y_pred_classes)
+            precision = precision_score(y_test, y_pred_classes, average='weighted')
+            recall = recall_score(y_test, y_pred_classes, average='weighted')
+            f1 = f1_score(y_test, y_pred_classes, average='weighted')
+
+            logging.info(f"""
+                Метрики финальной модели:
+                Accuracy: {accuracy:.4f}
+                Precision: {precision:.4f}
+                Recall: {recall:.4f}
+                F1-Score: {f1:.4f}
+            """)
+
+            # Сохранение модели только при высоком качестве
+            if f1 >= 0.80:
+                final_model.save(model_path)
+                joblib.dump(xgb_model, "xgb_model.pkl")  # ✅ Сохраняем XGBoost отдельно
+                logging.info(f"Финальная модель LSTM-GRU сохранена в {model_path}")
+                logging.info(f"XGBoost-модель сохранена в xgb_model.pkl")
+
+                # **Построение графика обучения**
+                plt.figure(figsize=(10, 6))
+                plt.plot(history.history['loss'], label='Train Loss')
+                plt.plot(history.history['val_loss'], label='Validation Loss', linestyle='--')
+                plt.legend()
+                plt.title('Train vs Validation Loss')
+                plt.xlabel('Epochs')
+                plt.ylabel('Loss')
+                plt.grid(True)
+                plt.show()
+
+                return final_model
+            else:
+                logging.warning("Финальное качество модели ниже порогового (80% F1-score). Модель не сохранена.")
+                return None
+
 
 
 if __name__ == "__main__":
     # Инициализация стратегии (TPU или CPU/GPU)
     strategy = initialize_strategy()
     
-    # Инициализация клиента Binance
-    proxies = {
-        'http': 'http://your-proxy.com:port',
-        'https': 'http://your-proxy.com:port',
-    }
-
-    client = Client(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET", requests_params={"proxies": proxies})
-
     
-    symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT','XRPUSDT', 'ADAUSDT', 'SOLUSDT', 'DOTUSDT', 'LINKUSDT', 'TONUSDT', 'NEARUSDT']
+    symbols = ['BTCUSDC', 'ETHUSDC', 'BNBUSDC','XRPUSDC', 'ADAUSDC', 'SOLUSDC', 'DOTUSDC', 'LINKUSDC', 'TONUSDC', 'NEARUSDC']
     
     start_date = datetime(2017, 1, 1)
-    end_date = datetime(2024, 7, 31)
+    end_date = datetime(2024, 9, 31)
     
     data_path = "labeled_market_data.csv"  # Путь к размеченным данным
     model_path = "market_condition_classifier.h5"  # Путь для сохранения модели
     scaler_path = "scaler.pkl"  # Путь для сохранения масштабировщика
 
     # Создание экземпляра классификатора
-    classifier = MarketClassifier(client)
+    classifier = MarketClassifier()
 
     # Загрузка и разметка данных
     try:
@@ -701,5 +919,4 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Ошибка в процессе обучения: {e}")
         exit(1)
-
 

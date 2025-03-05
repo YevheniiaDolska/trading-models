@@ -30,25 +30,37 @@ from tensorflow.keras.models import load_model
 import sys
 from tensorflow.keras.backend import clear_session
 import glob
+import requests
+import zipfile
+from io import BytesIO
+from threading import Lock
+from ta.trend import SMAIndicator
+import matplotlib.pyplot as plt
+from xgboost import XGBRegressor
+from tensorflow.keras.models import Model
+from xgboost import XGBClassifier
+from sklearn.metrics import f1_score
+import joblib
+from filterpy.kalman import KalmanFilter
 
 
 
-# Инициализация GPU
 def initialize_strategy():
-    # Проверяем наличие GPU
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            strategy = tf.distribute.MirroredStrategy()
-            print(f'Running on {len(gpus)} GPUs')
-        except RuntimeError as e:
-            print(e)
-    else:
-        strategy = tf.distribute.get_strategy()
-        print('Running on CPU')
+    """
+    Инициализирует TPU, если доступен, или возвращает стратегию для CPU/GPU.
+    """
+    try:
+        tpu = tf.distribute.cluster_resolver.TPUClusterResolver()  # TPU detection
+        print('Running on TPU ', tpu.cluster_spec().as_dict()['worker'])
+        tf.config.experimental_connect_to_cluster(tpu)
+        tf.tpu.experimental.initialize_tpu_system(tpu)
+        strategy = tf.distribute.TPUStrategy(tpu)
+    except ValueError:
+        print('Not connected to a TPU runtime. Using default strategy.')
+        strategy = tf.distribute.get_strategy()  # Fallback to CPU/GPU strategy
+    print('Running with strategy:', strategy)
     return strategy
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,6 +78,21 @@ def save_logs_to_file(log_message):
         log_f.write(f"{datetime.now()}: {log_message}\n")
         
         
+
+def cleanup_training_files():
+    """
+    Удаляет файлы с обучающими данными после завершения обучения нейросети.
+    """
+    files_to_delete = glob.glob("binance_data*.csv")  # Ищем все файлы данных
+    for file_path in files_to_delete:
+        try:
+            os.remove(file_path)
+            logging.info(f"🗑 Удалён файл: {file_path}")
+        except Exception as e:
+            logging.error(f"⚠ Ошибка удаления {file_path}: {e}")
+            
+        
+        
 def calculate_cross_coin_features(data_dict):
     """
     Рассчитывает межмонетные признаки для всех пар.
@@ -75,7 +102,7 @@ def calculate_cross_coin_features(data_dict):
     Returns:
         dict: Словарь DataFrame'ов с добавленными признаками
     """
-    btc_data = data_dict['BTCUSDT']
+    btc_data = data_dict['BTCUSDC']
     
     for symbol, df in data_dict.items():
         # Корреляции с BTC
@@ -148,7 +175,6 @@ def remove_noise(data):
     data = data.copy()
     
     # Kalman filter для сглаживания цены
-    from filterpy.kalman import KalmanFilter
     kf = KalmanFilter(dim_x=2, dim_z=1)
     kf.x = np.array([[data['close'].iloc[0]], [0.]])
     kf.F = np.array([[1., 1.], [0., 1.]])
@@ -361,60 +387,208 @@ def load_all_data(symbols, start_date, end_date, interval='1m'):
         raise
 
 
-# Загрузка данных с Binance
-def get_historical_data(symbol, interval, start_date, end_date):
-    logging.info(f"Начало загрузки данных для {symbol}, период: с {start_date} по {end_date}, интервал: {interval}")
-    data = pd.DataFrame()
-    client = Client()
-    current_date = start_date
-    while current_date < end_date:
-        next_date = min(current_date + timedelta(days=30), end_date)
-        try:
-            logging.info(f"Загрузка данных для {symbol}: с {current_date} по {next_date}")
-            klines = client.get_historical_klines(symbol, interval, current_date.strftime('%d %b %Y %H:%M:%S'), next_date.strftime('%d %b %Y %H:%M:%S'), limit=1000)
-            if not klines:
-                logging.warning(f"Нет данных для {symbol} за период с {current_date} по {next_date}")
-                continue
-            temp_data = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-            temp_data['timestamp'] = pd.to_datetime(temp_data['timestamp'], unit='ms')
-            temp_data.set_index('timestamp', inplace=True)
-            data = pd.concat([data, temp_data[['open', 'high', 'low', 'close', 'volume']].astype(float)])
-            logging.info(f"Данные успешно добавлены для {symbol}. Размер текущих данных: {len(data)} строк.")
-        except Exception as e:
-            logging.error(f"Ошибка при загрузке данных для {symbol} за период {current_date} - {next_date}: {e}")
-            save_logs_to_file(f"Ошибка при загрузке данных для {symbol} за период {current_date} - {next_date}: {e}")
-        current_date = next_date
+# Получение исторических данных
+def get_historical_data(symbols, bearish_periods, interval="1m", save_path="binance_data_bearish.csv"):
+    """
+    Скачивает исторические данные с Binance (архив) и сохраняет в один CSV-файл.
 
-    if data.empty:
-        logging.warning(f"Данные для {symbol} пусты.")
-    return data
-
-def load_bearish_data(symbols, bearish_periods, interval="1m"):
+    :param symbols: список торговых пар (пример: ['BTCUSDC', 'ETHUSDC'])
+    :param bearish_periods: список словарей с периодами (пример: [{"start": "2019-01-01", "end": "2019-12-31"}])
+    :param interval: временной интервал (по умолчанию "1m" - 1 минута)
+    :param save_path: путь к файлу для сохранения CSV (по умолчанию 'binance_data_bearish.csv')
+    """
+    base_url_monthly = "https://data.binance.vision/data/spot/monthly/klines"
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    
     all_data = []
-    logging.info(f"Начало загрузки данных за медвежьи периоды для символов: {symbols}")
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = []
-        for period in bearish_periods:
-            start_date = datetime.strptime(period["start"], "%Y-%m-%d")
-            end_date = datetime.strptime(period["end"], "%Y-%m-%d")
-            for symbol in symbols:
-                futures.append(executor.submit(get_historical_data, symbol, interval, start_date, end_date))
-        
-        for future in futures:
-            try:
-                symbol_data = future.result()
-                if symbol_data is not None:
-                    all_data.append(symbol_data)
-            except Exception as e:
-                logging.error(f"Ошибка загрузки данных: {e}")
+    downloaded_files = set()
+    download_lock = Lock()  # Используем threading.Lock
 
-    if all_data:
-        data = pd.concat(all_data, ignore_index=False)
-        logging.info(f"Всего загружено {len(data)} строк данных")
-        return data
+    def download_and_process(symbol, period):
+        start_date = datetime.strptime(period["start"], "%Y-%m-%d")
+        end_date = datetime.strptime(period["end"], "%Y-%m-%d")
+        temp_data = []
+
+        for current_date in pd.date_range(start=start_date, end=end_date, freq='MS'):  # MS = Monthly Start
+            year = current_date.year
+            month = current_date.month
+            month_str = f"{month:02d}"
+
+            file_name = f"{symbol}-{interval}-{year}-{month_str}.zip"
+            file_url = f"{base_url_monthly}/{symbol}/{interval}/{file_name}"
+
+            # Блокируем доступ к скачиванию и проверяем, был ли файл уже скачан
+            with download_lock:
+                if file_name in downloaded_files:
+                    logging.info(f"⏩ Пропуск скачивания {file_name}, уже загружено.")
+                    continue  # Пропускаем скачивание
+
+                logging.info(f"🔍 Проверка наличия файла: {file_url}")
+                response = requests.head(file_url, timeout=5)
+                if response.status_code != 200:
+                    logging.warning(f"⚠ Файл не найден: {file_url}")
+                    continue
+
+                logging.info(f"📥 Скачивание {file_url}...")
+                response = requests.get(file_url, timeout=15)
+                if response.status_code != 200:
+                    logging.warning(f"⚠ Ошибка загрузки {file_url}: Код {response.status_code}")
+                    continue
+
+                logging.info(f"✅ Успешно загружен {file_name}")
+                downloaded_files.add(file_name)  # Добавляем в кэш загруженных файлов
+
+            try:
+                zip_file = zipfile.ZipFile(BytesIO(response.content))
+                csv_file = file_name.replace('.zip', '.csv')
+
+                with zip_file.open(csv_file) as file:
+                    df = pd.read_csv(file, header=None, names=[
+                        "timestamp", "open", "high", "low", "close", "volume",
+                        "close_time", "quote_asset_volume", "number_of_trades",
+                        "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+                    ], dtype={
+                        "timestamp": "int64",
+                        "open": "float32",
+                        "high": "float32",
+                        "low": "float32",
+                        "close": "float32",
+                        "volume": "float32",
+                        "quote_asset_volume": "float32",
+                        "number_of_trades": "int32",
+                        "taker_buy_base_asset_volume": "float32",
+                        "taker_buy_quote_asset_volume": "float32"
+                    })
+
+                    # 🛠 Проверяем, загружен ли timestamp
+                    if "timestamp" not in df.columns:
+                        logging.error(f"❌ Ошибка: Колонка 'timestamp' отсутствует в df для {symbol}")
+                        return None
+
+                    # 🛠 Преобразуем timestamp в datetime и ставим индекс
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+                    df.set_index("timestamp", inplace=True)
+                    
+                    df["symbol"] = symbol
+
+                    temp_data.append(df)
+            except Exception as e:
+                logging.error(f"❌ Ошибка обработки {symbol} за {current_date.strftime('%Y-%m')}: {e}")
+
+            time.sleep(0.5)  # Минимальная задержка между скачиваниями
+
+        return pd.concat(temp_data) if temp_data else None
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(download_and_process, symbol, period) for symbol in symbols for period in bearish_periods]
+        for future in futures:
+            result = future.result()
+            if result is not None:
+                all_data.append(result)
+
+    if not all_data:
+        logging.error("❌ Не удалось загрузить ни одного месяца данных.")
+        return None
+
+    df = pd.concat(all_data, ignore_index=False)  # Не используем ignore_index, чтобы сохранить timestamp  
+
+    # Проверяем, какие колонки есть в DataFrame
+    logging.info(f"📊 Колонки в загруженном df: {df.columns}")
+
+    # Проверяем, установлен ли временной индекс
+    if "timestamp" not in df.columns and not isinstance(df.index, pd.DatetimeIndex):
+        logging.error(f"❌ Колонка 'timestamp' отсутствует. Доступные колонки: {df.columns}")
+        return None
+
+    # Теперь можно применять resample
+    df = df.resample('1min').ffill()  # Минутные интервалы, заполняем пропущенные значения
+
+    # Проверяем NaN
+    num_nans = df.isna().sum().sum()
+    if num_nans > 0:
+        nan_percentage = num_nans / len(df)
+        if nan_percentage > 0.05:  # Если более 5% данных пропущены
+            logging.warning(f"⚠ Пропущено {nan_percentage:.2%} данных! Удаляем пропущенные строки.")
+            df.dropna(inplace=True)
+        else:
+            logging.info(f"🔧 Заполняем {nan_percentage:.2%} пропущенных данных ffill.")
+            df.fillna(method='ffill', inplace=True)  # Заполняем предыдущими значениями
+
+    df.to_csv(save_path)
+    logging.info(f"💾 Данные сохранены в {save_path}")
+
+    return save_path
+
+
+def load_bearish_data(symbols, bearish_periods, interval="1m", save_path="binance_data_bearish.csv"):
+    """
+    Загружает данные для флэтового рынка для заданных символов и периодов.
+    Если файл save_path уже существует, новые данные объединяются с уже сохранёнными.
+    Возвращает словарь, где для каждого символа содержится DataFrame с объединёнными данными.
+    """
+    # Если файл уже существует – читаем существующие данные
+    if os.path.exists(save_path):
+        try:
+            existing_data = pd.read_csv(save_path, index_col=0, parse_dates=True, on_bad_lines='skip')
+            logging.info(f"Считаны существующие данные из {save_path}, строк: {len(existing_data)}")
+        except Exception as e:
+            logging.error(f"Ошибка при чтении существующего файла {save_path}: {e}")
+            existing_data = pd.DataFrame()
     else:
-        logging.error("Не удалось загрузить данные.")
-        raise ValueError("Не удалось загрузить данные.")
+        existing_data = pd.DataFrame()
+
+    all_data = {}  # Словарь для хранения данных по каждому символу
+    logging.info(f"🚀 Начало загрузки данных за заданные периоды для символов: {symbols}")
+
+    # Запускаем загрузку данных параллельно для каждого символа
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        # Передаём в get_historical_data параметр save_path, чтобы все загрузки записывались в один файл
+        futures = {
+            executor.submit(get_historical_data, [symbol], bearish_periods, interval, save_path): symbol
+            for symbol in symbols
+        }
+        for future in futures:
+            symbol = futures[future]
+            try:
+                # get_historical_data возвращает путь к файлу с загруженными данными
+                temp_file_path = future.result()
+                if temp_file_path is not None:
+                    # Используем on_bad_lines='skip', чтобы пропустить проблемные строки
+                    new_data = pd.read_csv(temp_file_path, index_col=0, parse_dates=True, on_bad_lines='skip')
+                    if symbol in all_data:
+                        all_data[symbol].append(new_data)
+                    else:
+                        all_data[symbol] = [new_data]
+                    logging.info(f"✅ Данные добавлены для {symbol}. Текущий список: {len(all_data[symbol])} файлов.")
+            except Exception as e:
+                logging.error(f"❌ Ошибка загрузки данных для {symbol}: {e}")
+
+    # Объединяем данные для каждого символа, если список не пустой
+    for symbol in list(all_data.keys()):
+        if all_data[symbol]:
+            all_data[symbol] = pd.concat(all_data[symbol])
+        else:
+            del all_data[symbol]
+
+    # Объединяем данные всех символов в один DataFrame
+    if all_data:
+        new_combined = pd.concat(all_data.values(), ignore_index=False)
+    else:
+        new_combined = pd.DataFrame()
+
+    # Объединяем с уже существующими данными (если таковые имеются)
+    if not existing_data.empty:
+        combined = pd.concat([existing_data, new_combined], ignore_index=False)
+    else:
+        combined = new_combined
+
+    # Сохраняем итоговый объединённый DataFrame в единый CSV-файл
+    combined.to_csv(save_path)
+    logging.info(f"💾 Обновлённые данные сохранены в {save_path} (итоговых строк: {len(combined)})")
+
+    # Возвращаем словарь с данными по каждому символу (обновлёнными только новыми данными)
+    return all_data
+
 
 '''def aggregate_to_2min(data):
     """
@@ -662,6 +836,12 @@ def extract_features(data):
     logging.info(f"Количество признаков: {len(features_df.columns)}")
     logging.info(f"Проверка на NaN: {features_df.isna().sum().sum()}")
     logging.info(f"Распределение целевой переменной:\n{features_df['target'].value_counts()}")
+    
+    logging.info(f"✅ Итоговые признаки: {list(data.columns)}")
+    num_nans = data.isna().sum().sum()
+    if num_nans > 0:
+        logging.warning(f"⚠ Найдено {num_nans} пропущенных значений. Заполняем...")
+        data.fillna(0, inplace=True)
 
 
     return features_df.replace([np.inf, -np.inf], np.nan).ffill().bfill()
@@ -758,314 +938,326 @@ def balance_classes(X, y):
     logging.info(f"Размеры данных после балансировки: X={X_resampled.shape}, y={y_resampled.shape}")
     return X_resampled, y_resampled
 
+def train_xgboost_on_embeddings(X_emb, y):
+    """
+    Обучает XGBoost-классификатор на эмбеддингах, извлечённых из нейросети.
+    Предполагается, что целевая переменная y принимает значения из {0, 1, 2}.
+    Эта функция адаптирована для медвежьего рынка, но при необходимости можно
+    изменить параметры для лучшей подгонки под ваши данные.
+    """
+    logging.info("Обучение XGBoost на эмбеддингах...")
+    xgb_model = XGBClassifier(
+        objective='multi:softprob',  # многоклассовая задача
+        n_estimators=10,
+        max_depth=3,
+        learning_rate=0.01,
+        random_state=42,
+        num_class=3  # 3 класса
+    )
+    xgb_model.fit(X_emb, y)
+    logging.info("XGBoost обучен на эмбеддингах.")
+    return xgb_model
+
+
+
+def prepare_timestamp_column(data):
+    """
+    Гарантированно создаёт столбец 'timestamp' для DataFrame.
+    
+    Алгоритм:
+      1. Если столбец 'timestamp' уже присутствует, он удаляется.
+      2. Выполняется data.reset_index(), чтобы преобразовать индекс (который должен быть DatetimeIndex)
+         в столбец. Если индекс имеет собственное имя (например, 'timestamp' или другое), его переименовываем в 'timestamp'.
+      3. Результат возвращается — DataFrame, где столбец 'timestamp' точно присутствует.
+      
+    Этот метод гарантированно создаёт нужный столбец без риска дублирования.
+    """
+    logging.info("Убеждаемся, что столбец 'timestamp' присутствует, используя reset_index().")
+    
+    # Если 'timestamp' уже есть, удаляем его, чтобы избежать дублирования
+    if 'timestamp' in data.columns:
+        logging.info("Обнаружен столбец 'timestamp'. Удаляем его для корректного создания нового.")
+        data = data.drop(columns=['timestamp'])
+    
+    # Сбрасываем индекс: если индекс является DatetimeIndex, то он превратится в колонку
+    data = data.reset_index()
+    
+    # Если после сброса индекс назывался не 'timestamp', переименовываем его
+    if 'timestamp' not in data.columns:
+        # Если индекс сброшен как 'index', то переименовываем его в 'timestamp'
+        if 'index' in data.columns:
+            data.rename(columns={'index': 'timestamp'}, inplace=True)
+            logging.info("Колонка 'index' переименована в 'timestamp'.")
+        else:
+            # Если ни 'timestamp', ни 'index' не присутствуют, создаём столбец на основе текущего индекса
+            data['timestamp'] = data.index
+            logging.info("Столбец 'timestamp' создан из индекса.")
+    else:
+        # Приводим существующий столбец к типу datetime
+        data['timestamp'] = pd.to_datetime(data['timestamp'], errors='coerce')
+        logging.info("Столбец 'timestamp' приведён к типу datetime.")
+    
+    # Дополнительно можно переставить столбец 'timestamp' на первую позицию, если это нужно
+    cols = list(data.columns)
+    if cols[0] != 'timestamp':
+        cols.insert(0, cols.pop(cols.index('timestamp')))
+        data = data[cols]
+        logging.info("Столбец 'timestamp' переставлен в начало DataFrame.")
+    
+    return data
 
 
 def build_bearish_neural_network(data):
     """
-    Обучение нейронной сети для медвежьего рынка.
-
-    Аргументы:
-        data (pd.DataFrame): Данные с признаками и целевым значением ('target').
-
-    Возвращает:
-        model: Обученная модель.
+    Обучает нейронную сеть для медвежьего рынка с корректной обработкой временной метки.
+    
+    Здесь в самом начале данные передаются через prepare_timestamp_column,
+    которая сбрасывает индекс и создаёт (или обновляет) столбец 'timestamp'. 
+    Далее происходит выбор признаков, балансировка, разделение выборок, масштабирование и обучение модели,
+    сохраняя весь продвинутый функционал (архитектуру LSTM, ансамблирование с XGBoost и пр.).
+    
+    Важно: теперь никакие reset_index() не выполняются после вызова этой функции.
     """
-    # Создаем директории для чекпоинтов
-    os.makedirs("checkpoints", exist_ok=True)
+    logging.info("Начало обучения нейронной сети для медвежьего рынка.")
     
-    network_name = "bearish_neural_network"
-    checkpoint_path_regular = f"checkpoints/{network_name}_checkpoint_epoch_{{epoch:02d}}.h5"
-    checkpoint_path_best = f"checkpoints/{network_name}_best_model.h5"
+    # Гарантированно создаём столбец 'timestamp'
+    data = prepare_timestamp_column(data)
     
-    if os.path.exists("bearish_neural_network.h5"):
-        try:
-            model = load_model("bearish_neural_network.h5", custom_objects={"custom_profit_loss": custom_profit_loss})
-            logging.info("Обученная модель загружена из 'bearish_neural_network.h5'. Пропускаем обучение.")
-            return model
-        except Exception as e:
-            logging.error(f"Ошибка при загрузке модели: {e}")
-            logging.info("Начинаем обучение с нуля.")
-    else:
-        logging.info("Сохраненная модель не найдена. Начинаем обучение с нуля.")
+    # Выбираем числовые признаки (исключая 'target' и 'timestamp')
+    selected_features = [
+        col for col in data.columns 
+        if col not in ['target', 'timestamp'] and pd.api.types.is_numeric_dtype(data[col])
+    ]
+    y = data['target'].copy()
+    X = data[selected_features].copy()
     
-        
-    logging.info("Начало подготовки данных для обучения нейронной сети.")
-
-    # Выделяем признаки и целевое значение
-    features = [col for col in data.columns if col not in ['target', 'timestamp'] and pd.api.types.is_numeric_dtype(data[col])]
-    X = data[features].values
-    y = data['target'].values
-
-    # Логируем начальные размеры данных
     logging.info(f"Размер X до фильтрации: {X.shape}")
     logging.info(f"Размер y до фильтрации: {y.shape}")
     logging.info(f"Уникальные значения y: {np.unique(y, return_counts=True)}")
     
-    # Убеждаемся, что все данные числовые
     X = X.astype(float)
     y = y.astype(int)
-
-    # Проверяем, есть ли NaN и удаляем их
     mask = ~np.isnan(y)
     X = X[mask]
     y = y[mask]
-
     if X.size == 0 or y.size == 0:
         logging.error("X или y пусты после удаления NaN. Проверьте обработку данных.")
         raise ValueError("X или y пусты после удаления NaN.")
-
     logging.info(f"Размер X после фильтрации: {X.shape}")
     logging.info(f"Размер y после фильтрации: {y.shape}")
-
-    # Балансировка классов
-    try:
-        X_resampled, y_resampled = balance_classes(X, y)
-        logging.info(f"Размеры после балансировки: X_resampled={X_resampled.shape}, y_resampled={y_resampled.shape}")
-        logging.info(f"Уникальные значения в y_resampled: {np.unique(y_resampled, return_counts=True)}")
-    except ValueError as e:
-        logging.error(f"Ошибка при балансировке классов: {e}")
-        raise
-
-    # Разделение данных на обучающую и валидационную выборки
-    X_train, X_val, y_train, y_val = train_test_split(X_resampled, y_resampled, test_size=0.2, random_state=42)
-
+    
+    X_resampled, y_resampled = balance_classes(X, y)
+    logging.info(f"Размеры после балансировки: X_resampled={X_resampled.shape}, y_resampled={y_resampled.shape}")
+    logging.info(f"Распределение классов после балансировки:\n{pd.Series(y_resampled).value_counts()}")
+    X_resampled = pd.DataFrame(X_resampled, columns=X.columns)
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled
+    )
     logging.info(f"Размеры тренировочных данных: X_train={X_train.shape}, y_train={y_train.shape}")
     logging.info(f"Размеры валидационных данных: X_val={X_val.shape}, y_val={y_val.shape}")
-
-    # Масштабирование данных
+    
     scaler = RobustScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
-
-    # Добавление временного измерения для LSTM
     X_train_scaled = X_train_scaled.reshape((X_train_scaled.shape[0], 1, X_train_scaled.shape[1]))
     X_val_scaled = X_val_scaled.reshape((X_val_scaled.shape[0], 1, X_val_scaled.shape[1]))
-
-    # Создание tf.data.Dataset
+    
     train_dataset = tf.data.Dataset.from_tensor_slices((X_train_scaled, y_train)).batch(32).prefetch(tf.data.AUTOTUNE)
     val_dataset = tf.data.Dataset.from_tensor_slices((X_val_scaled, y_val)).batch(32).prefetch(tf.data.AUTOTUNE)
     
-    
     def hft_metrics(y_true, y_pred):
-        # Метрика для оценки скорости реакции
         reaction_time = tf.reduce_mean(tf.abs(y_pred[1:] - y_pred[:-1]))
-        # Метрика для оценки стабильности сигналов
-        signal_stability = tf.reduce_mean(tf.abs(y_pred[2:] - 2*y_pred[1:-1] + y_pred[:-2]))
+        signal_stability = tf.reduce_mean(tf.abs(y_pred[2:] - 2 * y_pred[1:-1] + y_pred[:-2]))
         return reaction_time, signal_stability
     
-    # Инициализация модели
+    def profit_ratio(y_true, y_pred):
+        successful_shorts = tf.reduce_sum(tf.where(tf.logical_and(y_true >= 1, y_pred >= 0.5), 1.0, 0.0))
+        false_signals = tf.reduce_sum(tf.where(tf.logical_and(y_true == 0, y_pred >= 0.5), 1.0, 0.0))
+        return successful_shorts / (false_signals + K.epsilon())
+    
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            strategy = tf.distribute.MirroredStrategy()
+            logging.info("GPU инициализированы с использованием MirroredStrategy")
+        except RuntimeError as e:
+            logging.error(f"Ошибка при инициализации GPU: {e}")
+            strategy = tf.distribute.get_strategy()
+    else:
+        strategy = tf.distribute.get_strategy()
+        logging.info("GPU не найдены, используется стратегия по умолчанию")
+    
+    logging.info("Начинаем создание модели для медвежьего рынка...")
     with strategy.scope():
         inputs = Input(shape=(X_train_scaled.shape[1], X_train_scaled.shape[2]))
-        
-        # Первая ветвь - анализ паттернов цены
         x1 = LSTM(256, return_sequences=True)(inputs)
         x1 = BatchNormalization()(x1)
         x1 = Dropout(0.3)(x1)
-        
-        # Вторая ветвь - анализ объемов и волатильности
         x2 = LSTM(256, return_sequences=True)(inputs)
         x2 = BatchNormalization()(x2)
         x2 = Dropout(0.3)(x2)
-        
-        # Третья ветвь - анализ рыночного контекста
         x3 = LSTM(256, return_sequences=True, name='market_context')(inputs)
         x3 = BatchNormalization()(x3)
         x3 = Dropout(0.3)(x3)
-        
-        # Объединение всех трех ветвей
         x = Add()([x1, x2, x3])
-        
-        # Основной LSTM для принятия решений
         x = LSTM(256, return_sequences=False)(x)
         x = BatchNormalization()(x)
         x = Dropout(0.3)(x)
-        
-        # Dense слои для финального анализа
+        x = Dense(128, activation='relu', name="embedding_layer")(x)
+        x = BatchNormalization()(x)
+        x = Dropout(0.3)(x)
         x = Dense(256, activation='relu')(x)
         x = BatchNormalization()(x)
         x = Dropout(0.3)(x)
-        
-        # Выходной слой с сигмоидой для вероятности падения
-        outputs = Dense(1, activation='sigmoid')(x)
-        
+        outputs = Dense(3, activation='softmax')(x)
         model = tf.keras.models.Model(inputs, outputs)
-        model.compile(
-            optimizer=Adam(learning_rate=0.001),
-            loss=custom_profit_loss,
-            metrics=[hft_metrics]  # Добавляем новые метрики
-        )
-
+    
+        model.compile(optimizer=Adam(learning_rate=0.001),
+                      loss=custom_profit_loss,
+                      metrics=[hft_metrics, profit_ratio])
+    
         try:
-            model.load_weights(checkpoint_path_regular.format(epoch=0))  # Используем определенный путь
+            model.load_weights(checkpoint_path_regular.format(epoch=0))
             logging.info(f"Загружены веса модели из {checkpoint_path_regular.format(epoch=0)}")
         except FileNotFoundError:
-            logging.info(f"Контрольная точка не найдена. Начало обучения с нуля.")
+            logging.info("Контрольная точка не найдена. Начинаем обучение с нуля.")
     
-    logging.info("Проверка наличия чекпоинтов...")
-
-    # Попытка загрузить последний сохранённый промежуточный чекпоинт
-    regular_checkpoints = sorted(glob.glob(f"checkpoints/{network_name}_checkpoint_epoch_*.h5"))
+        regular_checkpoints = sorted(glob.glob(f"checkpoints/{network_name}_checkpoint_epoch_*.h5"))
+        if regular_checkpoints:
+            latest_checkpoint = regular_checkpoints[-1]
+            try:
+                model.load_weights(latest_checkpoint)
+                logging.info(f"Загружены веса из последнего регулярного чекпоинта: {latest_checkpoint}")
+            except Exception as e:
+                logging.error(f"Ошибка загрузки регулярного чекпоинта: {e}")
     
-    if regular_checkpoints:
-        latest_checkpoint = regular_checkpoints[-1]
+        if os.path.exists(checkpoint_path_best):
+            try:
+                model.load_weights(checkpoint_path_best)
+                logging.info(f"Лучший чекпоинт найден: {checkpoint_path_best}. После обучения промежуточные чекпоинты будут удалены.")
+            except Exception as e:
+                logging.info("Лучший чекпоинт пока не создан. Это ожидаемо, если обучение ещё не завершено.")
+    
+        checkpoint_every_epoch = ModelCheckpoint(filepath=checkpoint_path_regular,
+                                                 save_weights_only=True,
+                                                 save_best_only=False,
+                                                 verbose=1)
+        checkpoint_best_model = ModelCheckpoint(filepath=checkpoint_path_best,
+                                                save_weights_only=True,
+                                                save_best_only=True,
+                                                monitor='val_loss',
+                                                verbose=1)
+        tensorboard_callback = TensorBoard(log_dir=f"logs/{time.time()}")
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                                      patience=5, min_lr=1e-5, verbose=1)
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5,
+                                       restore_best_weights=True, mode='min')
+    
+        history = model.fit(train_dataset,
+                            epochs=200,
+                            validation_data=val_dataset,
+                            class_weight={0: 1.0, 1: 2.0, 2: 3.0},
+                            verbose=1,
+                            callbacks=[early_stopping, checkpoint_every_epoch,
+                                       checkpoint_best_model, tensorboard_callback,
+                                       reduce_lr])
+    
+        for checkpoint in glob.glob(f"checkpoints/{network_name}_checkpoint_epoch_*.h5"):
+            if checkpoint != checkpoint_path_best:
+                os.remove(checkpoint)
+                logging.info(f"Удалён чекпоинт: {checkpoint}")
+        logging.info("Очистка завершена. Сохранена только лучшая модель.")
+    
+        plt.figure(figsize=(10, 6))
+        plt.plot(history.history['loss'], label='Train Loss', color='blue')
+        plt.plot(history.history['val_loss'], label='Validation Loss', color='orange', linestyle='--')
+        plt.title('Train vs Validation Loss')
+        plt.xlabel('Epochs')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+    
         try:
-            model.load_weights(latest_checkpoint)
-            logging.info(f"Загружены веса из последнего регулярного чекпоинта: {latest_checkpoint}")
+            model.save("bearish_neural_network.h5")
+            logging.info("Модель успешно сохранена в 'bearish_neural_network.h5'")
         except Exception as e:
-            logging.error(f"Ошибка загрузки регулярного чекпоинта: {e}")
-
-    # Проверяем наличие лучшего чекпоинта
-    if os.path.exists(checkpoint_path_best):
+            logging.error(f"Ошибка при сохранении модели: {e}")
+    
+        logging.info("Этап ансамблирования: извлечение эмбеддингов и обучение XGBoost для медвежьего рынка.")
         try:
-            model.load_weights(checkpoint_path_best)
-            logging.info(f"Лучший чекпоинт найден: {checkpoint_path_best}. После обучения промежуточные чекпоинты будут удалены.")
-        except:
-            logging.info("Лучший чекпоинт пока не создан. Это ожидаемо, если обучение ещё не завершено.")
-        
-    # Настройка коллбеков
+            feature_extractor = Model(inputs=model.input, outputs=model.get_layer("embedding_layer").output)
+            embeddings_train = feature_extractor.predict(X_train_scaled)
+            embeddings_val = feature_extractor.predict(X_val_scaled)
+            logging.info(f"Эмбеддинги получены: embeddings_train.shape = {embeddings_train.shape}")
     
-    # Чекпоинт для регулярного сохранения прогресса
-    checkpoint_every_epoch = ModelCheckpoint(
-        filepath=checkpoint_path_regular,
-        save_weights_only=True,
-        save_best_only=False,
-        verbose=1
-    )
-
-    # Чекпоинт для сохранения только лучшей модели
-    checkpoint_best_model = ModelCheckpoint(
-        filepath=checkpoint_path_best,
-        save_weights_only=True,
-        save_best_only=True,
-        monitor='val_loss',
-        verbose=1
-    )
+            xgb_model = train_xgboost_on_embeddings(embeddings_train, y_train)
+            logging.info("XGBoost классификатор успешно обучен на эмбеддингах.")
     
+            nn_val_pred = model.predict(X_val_scaled)
+            xgb_val_pred = xgb_model.predict_proba(embeddings_val)
+            ensemble_val_pred = 0.5 * nn_val_pred + 0.5 * xgb_val_pred
+            ensemble_val_pred_class = np.argmax(ensemble_val_pred, axis=1)
+            ensemble_f1 = f1_score(y_val, ensemble_val_pred_class, average='weighted')
+            logging.info(f"Этап ансамблирования: F1-score ансамбля на валидации = {ensemble_f1:.4f}")
     
-    tensorboard_callback = TensorBoard(log_dir=f"logs/{time.time()}")
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001, verbose=1)
-    early_stopping = EarlyStopping(
-        monitor='val_hft_metrics',  # Мониторим упущенную прибыль
-        patience=15,                       # Меньше терпение для быстрой реакции
-        restore_best_weights=True,
-        mode='min'
-    )
+            joblib.dump(xgb_model, "xgb_model_bearish.pkl")
+            logging.info("XGBoost-модель сохранена в 'xgb_model_bearish.pkl'")
     
-
-    # Настройка весов классов для несбалансированных данных
-    class_weights = {
-        0: 1.0,    # Нет сигнала
-        1: 2.0,    # Умеренное падение
-        2: 3.0     # Сильное падение
-    }
+            ensemble_model = {"nn_model": model,
+                              "xgb_model": xgb_model,
+                              "feature_extractor": feature_extractor,
+                              "ensemble_weight_nn": 0.5,
+                              "ensemble_weight_xgb": 0.5}
+        except Exception as e:
+            logging.error(f"Ошибка на этапе ансамблирования: {e}")
+            ensemble_model = {"nn_model": model}
     
-    # Добавляем специальные метрики для оценки во время обучения
-    def profit_ratio(y_true, y_pred):
-        successful_shorts = tf.reduce_sum(tf.where(
-            tf.logical_and(y_true >= 1, y_pred >= 0.5),
-            1.0, 0.0
-        ))
-        false_signals = tf.reduce_sum(tf.where(
-            tf.logical_and(y_true == 0, y_pred >= 0.5),
-            1.0, 0.0
-        ))
-        return successful_shorts / (false_signals + K.epsilon())
+        return {"ensemble_model": ensemble_model, "scaler": scaler}
 
-    
-    # Обучение модели
-    history = model.fit(
-        train_dataset,
-        epochs=500,
-        validation_data=val_dataset,
-        class_weight=class_weights,
-        verbose=1,
-        callbacks=[
-            early_stopping,
-            checkpoint_every_epoch,
-            checkpoint_best_model,
-            tensorboard_callback,
-            reduce_lr
-        ]
-    )
-    
-    logging.info("Очистка промежуточных чекпоинтов...")
-    for checkpoint in glob.glob(f"checkpoints/{network_name}_checkpoint_epoch_*.h5"):
-        if checkpoint != checkpoint_path_best:  # Сохраняем лучшую модель
-            os.remove(checkpoint)
-            logging.info(f"Удалён чекпоинт: {checkpoint}")
-    logging.info("Очистка завершена. Сохранена только лучшая модель.")
-
-    
-    # Построение графика
-    plt.figure(figsize=(10, 6))
-    plt.plot(history.history['loss'], label='Train Loss', color='blue')
-    plt.plot(history.history['val_loss'], label='Validation Loss', color='orange', linestyle='--')
-    plt.title('Train vs Validation Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.grid(True)
-    plt.legend()
-    plt.show()
-
-
-    # Сохранение модели
-    model.save(nn_model_filename)
-    logging.info(f"Модель сохранена в {nn_model_filename}")
-    save_logs_to_file(f"Модель сохранена в {nn_model_filename}")
-
-    return model
-
-
-# Основной процесс обучения
 if __name__ == "__main__":
-    
-    # Инициализация стратегии (TPU или CPU/GPU)
-    strategy = initialize_strategy()
-
-    # Инициализация клиента Binance
-    proxies = {
-        'http': 'http://your-proxy.com:port',
-        'https': 'http://your-proxy.com:port',
-    }
-
-    client = Client(api_key="YOUR_API_KEY", api_secret="YOUR_API_SECRET", requests_params={"proxies": proxies})
-
-    
-    symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT','XRPUSDT', 'ADAUSDT', 'SOLUSDT', 'DOTUSDT', 'LINKUSDT', 'TONUSDT', 'NEARUSDT']
-    
-    bearish_periods = [
-    {"start": "2018-01-17", "end": "2018-12-31"},  # Пост-пик 2018 года, затяжной спад.
-    {"start": "2022-01-01", "end": "2022-12-31"},  # Годичный медвежий рынок 2022 года.
-]
-
-    # Загружаем данные и агрегируем их
-    data = load_bearish_data(symbols, bearish_periods, interval="1m")
-    
-    # Логирование проверки колонок
-    logging.info(f"Колонки в данных после загрузки: {data.columns.tolist()}")
-    logging.info(f"Размер данных после загрузки: {data.shape}")
-
-    # Проверка наличия timestamp
-    if 'timestamp' not in data.columns:
-        logging.error("Колонка 'timestamp' отсутствует после загрузки данных.")
-        # Если timestamp в индексе, переносим его в колонку
-        if isinstance(data.index, pd.DatetimeIndex):
-            data['timestamp'] = data.index
-            logging.info("Индекс был преобразован в колонку 'timestamp'.")
-        else:
-            raise ValueError("Колонка 'timestamp' отсутствует в данных.")
+    try:
+        strategy = initialize_strategy()
         
-    logging.info(f"Перед агрегацией данные имеют размер: {data.shape}")
-    logging.info(f"Колонки перед агрегацией: {data.columns.tolist()}")
-
+        symbols = ['BTCUSDC', 'ETHUSDC', 'BNBUSDC','XRPUSDC', 'ADAUSDC', 'SOLUSDC', 'DOTUSDC', 'LINKUSDC', 'TONUSDC', 'NEARUSDC']
         
-    #data = aggregate_to_2min(data)  # Преобразование в 2-минутный интервал
-    
-    data = extract_features(data)
-    
-    build_bearish_neural_network(data)
-    
-    logging.info("Очистка сессии TensorFlow...")
-    clear_session()  # Закрывает все графы и фоновые процессы TensorFlow
-    logging.info("Программа завершена.")
+        bearish_periods = [
+            {"start": "2018-01-17", "end": "2018-03-31"},
+            {"start": "2018-09-01", "end": "2018-12-31"},
+            {"start": "2021-05-12", "end": "2021-08-31"},
+            {"start": "2022-05-01", "end": "2022-07-31"},
+            {"start": "2022-09-01", "end": "2022-12-15"},
+            {"start": "2022-12-16", "end": "2023-01-31"}
+        ]
+        
+        logging.info("🔄 Загрузка данных для медвежьего периода...")
+        data_dict = load_bearish_data(symbols, bearish_periods, interval="1m")
+        if not data_dict:
+            raise ValueError("❌ Ошибка: Данные не были загружены!")
+        data = pd.concat(data_dict.values(), ignore_index=False)
+        if data.empty:
+            raise ValueError("❌ Ошибка: После загрузки данные пусты!")
+        # Здесь обязательно вызываем prepare_timestamp_column, чтобы создать столбец 'timestamp'
+        data = prepare_timestamp_column(data)
+        logging.info(f"ℹ После подготовки столбца, колонки: {data.columns.tolist()}")
+        logging.info(f"📈 Размер данных после загрузки: {data.shape}")
+        logging.info("🛠 Извлечение признаков из данных...")
+        data = extract_features(data)
+        data.dropna(inplace=True)
+        data = data.loc[:, ~data.columns.duplicated()]
+        if data.empty:
+            raise ValueError("❌ Ошибка: После очистки данные пусты!")
+        logging.info("🚀 Начало обучения модели для медвежьего рынка...")
+        build_bearish_neural_network(data)
+    except Exception as e:
+        logging.error(f"❌ Ошибка во время выполнения программы: {e}")
+    finally:
+        logging.info("🗑 Очистка временных файлов...")
+        cleanup_training_files()
+        logging.info("🧹 Очистка сессии TensorFlow...")
+        clear_session()
+        logging.info("✅ Программа завершена.")
     sys.exit(0)
